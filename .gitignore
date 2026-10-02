@@ -1,0 +1,21 @@
+# 1. 파이썬 가상환경 (용량이 매우 큼)
+env_build/
+venv/
+env/
+
+# 2. PyInstaller 빌드 결과물 (배포용 파일들)
+build/
+dist/
+*.spec
+
+# 3. 데이터셋 및 사진 폴더 (개인정보 및 용량 문제)
+dataset/
+Collected_Dataset/
+
+# 4. 인공지능 모델 가중치 파일 (깃허브 용량 제한 초과 방지)
+*.pth
+
+# 5. 파이썬 실행 캐시 찌꺼기
+__pycache__/
+*.pyc
+*.pyo
