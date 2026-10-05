@@ -2,8 +2,9 @@ import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 import timm
 import openpyxl
@@ -13,6 +14,24 @@ def get_executable_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.abspath(os.path.dirname(__file__))
+
+# ---------------------------------------------------------
+# [V2.0] 투-헤드(Two-Head) 모델 
+# ---------------------------------------------------------
+class MultiHeadDentalModel(nn.Module):
+    def __init__(self, num_classes):
+        super(MultiHeadDentalModel, self).__init__()
+        self.backbone = timm.create_model('resnet18', pretrained=False, num_classes=0)
+        num_features = self.backbone.num_features
+        
+        self.fc_class = nn.Linear(num_features, num_classes)
+        self.fc_rot = nn.Linear(num_features, 4)           
+
+    def forward(self, x):
+        features = self.backbone(x)
+        out_class = self.fc_class(features)
+        out_rot = self.fc_rot(features)
+        return out_class, out_rot
 
 class DentalAIModel:
     def __init__(self):
@@ -37,7 +56,6 @@ class DentalAIModel:
         if os.path.exists(class_txt_path):
             with open(class_txt_path, 'r', encoding='utf-8') as f:
                 self.class_names = [line.strip() for line in f.readlines() if line.strip()]
-        
         elif os.path.exists(dataset_dir):
             classes = sorted(entry.name for entry in os.scandir(dataset_dir) if entry.is_dir())
             valid_classes = []
@@ -50,73 +68,75 @@ class DentalAIModel:
             with open(class_txt_path, 'w', encoding='utf-8') as f:
                 for c in valid_classes:
                     f.write(f"{c}\n")
-            print(f"[자동 생성] class_names.txt 파일이 생성되었습니다. (총 {len(self.class_names)}개)")
 
     def load_model(self):
-        model_path = os.path.join(get_executable_dir(), "dental_model.pth")
+        model_path = os.path.join(get_executable_dir(), "dental_model_v2.pth")
         try:
             if os.path.exists(model_path):
+                self.model = MultiHeadDentalModel(len(self.class_names))
                 state_dict = torch.load(model_path, map_location=self.device)
-                actual_num_classes = state_dict['fc.weight'].shape[0]
-                
-                self.model = timm.create_model('resnet18', pretrained=False, num_classes=actual_num_classes) 
                 self.model.load_state_dict(state_dict)
                 self.model.to(self.device)
                 self.model.eval()
-                print("✅ 모델 로딩 완벽 성공!")
+                print("✅ V2.0 자동 정렬 모델 로딩 성공!")
             else:
-                print("경고: dental_model.pth 가중치 파일이 없습니다.")
+                print("경고: dental_model_v2.pth 가중치 파일이 없습니다.")
         except Exception as e:
             print(f"모델 로딩 에러: {e}")
 
     def predict(self, image_path, candidates):
         if self.model is None or not self.class_names:
-            return "미상", "미상", "미상"
+            return "미상", "미상", "미상", 0
         
         try:
             image = Image.open(image_path).convert('RGB')
+            image = ImageOps.exif_transpose(image)
             input_tensor = self.transform(image).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
-                outputs = self.model(input_tensor) 
+                out_class, out_rot = self.model(input_tensor) 
                 
                 if candidates:
                     valid_indices = []
                     for i, name in enumerate(self.class_names):
                         if any(name.startswith(cand) for cand in candidates):
                             valid_indices.append(i)
-                    
                     if valid_indices:
-                        mask = torch.ones_like(outputs, dtype=torch.bool)
+                        mask = torch.ones_like(out_class, dtype=torch.bool)
                         mask[0, valid_indices] = False
-                        outputs[mask] = -float('inf')
+                        out_class[mask] = -float('inf')
                 
-                _, predicted = torch.max(outputs, 1)
-                idx = predicted.item()
+                _, predicted_class = torch.max(out_class, 1)
+                _, predicted_rot = torch.max(out_rot, 1)
+                
+                idx = predicted_class.item()
+                rot_label = predicted_rot.item()
                 
             predicted_label = self.class_names[idx]
-            
             parts = predicted_label.split('_')
             if len(parts) >= 3:
-                return parts[0], parts[1], parts[2]
-            return predicted_label, "", ""
+                return parts[0], parts[1], parts[2], rot_label
+            return predicted_label, "", "", rot_label
             
         except Exception as e:
             print(f"추론 중 에러 발생: {e}")
-            return "에러", "에러", "에러"
+            return "에러", "에러", "에러", 0
+
 
 class DentalAutoSorterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("치과 방사선 사진 자동 정렬기 (조장용)")
-        self.root.geometry("1400x800")
+        self.root.title("치과 방사선 사진 자동 정렬기 V2.1.2 (레이아웃 최적화)")
+        self.root.geometry("1400x900")
         
         self.ai = DentalAIModel()
         self.image_data = []
         self.folder_path = ""
         self.student_data = {} 
         self.count_vars = [] 
+        self.student_cards = [] 
         self.naming_rules = {} 
+        self.reverse_rules = {} 
         
         self.load_naming_rules() 
         self.load_excel_data()
@@ -125,7 +145,6 @@ class DentalAutoSorterApp:
     def load_naming_rules(self):
         base_dir = get_executable_dir()
         rule_path = os.path.join(base_dir, "naming_rules.txt")
-        
         default_rules = {
             "SRT": "srt", "자연치": "nt",
             "상악절치": "상절", "상악견치": "상견", "상악소구치": "상소", 
@@ -134,37 +153,32 @@ class DentalAutoSorterApp:
             "하악제1대구치": "하대(1)", "하악제2대구치": "하대(2)",
             "근원": "근원심"
         }
-
         if not os.path.exists(rule_path):
             with open(rule_path, 'w', encoding='utf-8') as f:
                 f.write("# 파일명 변환 규칙 설정 파일입니다.\n")
-                f.write("# 왼쪽에는 폴더명(원본) = 오른쪽에는 변환될 이름(약어)을 적어주세요.\n\n")
                 for k, v in default_rules.items():
                     f.write(f"{k}={v}\n")
             self.naming_rules = default_rules
-            print("[자동 생성] naming_rules.txt 파일이 생성되었습니다.")
         else:
             with open(rule_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith("#"): 
-                        continue
+                    if not line or line.startswith("#"): continue
                     if "=" in line:
                         k, v = line.split("=", 1)
                         self.naming_rules[k.strip()] = v.strip()
+        self.reverse_rules = {v: k for k, v in self.naming_rules.items()}
 
     def load_excel_data(self):
         base_dir = get_executable_dir()
         excel_path = os.path.join(base_dir, "students.xlsx")
-        
         if not os.path.exists(excel_path):
-            messagebox.showwarning("경고", f"실행 파일과 같은 위치에 'students.xlsx'가 없습니다.\n임시 명단으로 빈칸이 표시됩니다.")
+            messagebox.showwarning("경고", f"'students.xlsx'가 없습니다.")
             return
 
         wb = openpyxl.load_workbook(excel_path, data_only=True)
         ws = wb.active
-        
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        for row in ws.iter_rows(min_row=1, values_only=True):
             if not row[0]: continue
             group = str(row[0])
             student_id = str(row[1]) if row[1] else ""
@@ -177,35 +191,62 @@ class DentalAutoSorterApp:
     def setup_ui(self):
         self.setup_candidate_ui()
 
+        # 💡 [레이아웃 2줄로 분리]
         top_frame = tk.Frame(self.root, pady=10, padx=10)
         top_frame.pack(fill="x", side="top")
 
-        tk.Label(top_frame, text="조 선택:").pack(side="left")
-        self.group_combo = ttk.Combobox(top_frame, values=list(self.student_data.keys()), state="readonly", width=10)
+        # --- 첫 번째 줄 (명단 및 순서 변경) ---
+        row1_frame = tk.Frame(top_frame)
+        row1_frame.pack(fill="x", side="top", anchor="nw")
+
+        tk.Label(row1_frame, text="조 선택:").pack(side="left")
+        self.group_combo = ttk.Combobox(row1_frame, values=list(self.student_data.keys()), state="readonly", width=10)
         self.group_combo.pack(side="left", padx=5)
         self.group_combo.bind("<<ComboboxSelected>>", self.on_group_select)
 
-        tk.Label(top_frame, text="조원별 사진 수:").pack(side="left", padx=(20, 5))
-        self.counts_frame = tk.Frame(top_frame) 
-        self.counts_frame.pack(side="left")
-        
-        tk.Button(top_frame, text="촬영사진 폴더 열기 & 자동 분류", command=self.load_folder, bg="#4CAF50", fg="white").pack(side="left", padx=30)
-        tk.Button(top_frame, text="결과 저장", command=self.save_all, bg="#008CBA", fg="white").pack(side="right", padx=10)
+        tk.Label(row1_frame, text="조원별 사진 수:\n(드래그로 순서 변경)", justify="right").pack(side="left", padx=(20, 5))
+        self.counts_frame = tk.Frame(row1_frame) 
+        self.counts_frame.pack(side="left", fill="x", expand=True)
 
+        # --- 두 번째 줄 (컨트롤 버튼들) ---
+        row2_frame = tk.Frame(top_frame)
+        row2_frame.pack(fill="x", side="top", pady=(15, 0))
+
+        # (왼쪽) 일괄변경 & 폴더열기
+        self.bulk_frame = tk.Frame(row2_frame)
+        self.bulk_frame.pack(side="left")
+        tk.Label(self.bulk_frame, text="사진수 일괄변경:").pack(side="left")
+        self.bulk_var = tk.StringVar(value="8") 
+        tk.Entry(self.bulk_frame, textvariable=self.bulk_var, width=4, justify="center").pack(side="left", padx=2)
+        tk.Button(self.bulk_frame, text="적용", command=self.apply_bulk_count, bg="#f0ad4e", fg="white").pack(side="left")
+        
+        tk.Button(row2_frame, text="촬영사진 폴더 열기 & 자동 분류", command=self.load_folder, bg="#4CAF50", fg="white", width=25).pack(side="left", padx=30)
+        
+        # (오른쪽) 결과저장 & 4번째칸 일괄입력
+        tk.Button(row2_frame, text="결과 저장", command=self.save_all, bg="#008CBA", fg="white", width=25).pack(side="right")
+
+        self.bulk_suffix_frame = tk.Frame(row2_frame)
+        self.bulk_suffix_frame.pack(side="right", padx=20)
+        tk.Label(self.bulk_suffix_frame, text="4번째 칸 일괄입력:").pack(side="left")
+        self.bulk_suffix_var = tk.StringVar()
+        tk.Entry(self.bulk_suffix_frame, textvariable=self.bulk_suffix_var, width=8).pack(side="left", padx=2)
+        tk.Button(self.bulk_suffix_frame, text="적용", command=self.apply_bulk_suffix, bg="#5bc0de", fg="white").pack(side="left")
+
+        # 메인 캔버스 
         canvas_frame = tk.Frame(self.root)
         canvas_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.canvas = tk.Canvas(canvas_frame, bg="gray90")
         self.v_scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
-        self.h_scrollbar = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
+        
         self.scrollable_frame = tk.Frame(self.canvas, bg="gray90")
-
         self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.v_scrollbar.set, xscrollcommand=self.h_scrollbar.set)
-
+        
+        self.frame_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.frame_id, width=e.width))
+        
+        self.canvas.configure(yscrollcommand=self.v_scrollbar.set)
         self.v_scrollbar.pack(side="right", fill="y")
-        self.h_scrollbar.pack(side="bottom", fill="x")
         self.canvas.pack(side="left", fill="both", expand=True)
 
     def setup_candidate_ui(self):
@@ -213,7 +254,6 @@ class DentalAutoSorterApp:
         cand_frame.pack(fill="x", padx=10, pady=(10, 0))
         
         self.cand_vars = {}
-        
         nat_frame = tk.Frame(cand_frame)
         nat_frame.pack(side="left", padx=10, anchor="n")
         tk.Label(nat_frame, text="[자연치 대분류]").pack(anchor="w")
@@ -241,12 +281,93 @@ class DentalAutoSorterApp:
         students = self.student_data.get(group, [])
         for widget in self.counts_frame.winfo_children():
             widget.destroy()
+            
         self.count_vars.clear()
+        self.student_cards.clear()
+        
         for idx, student in enumerate(students):
-            tk.Label(self.counts_frame, text=student['name'], font=("Arial", 9, "bold")).grid(row=0, column=idx, padx=5)
+            card_frame = tk.Frame(self.counts_frame, bd=1, relief="ridge", bg="white", cursor="fleur", padx=5, pady=2)
+            card_frame.pack(side="left", padx=3)
+
+            id_lbl = tk.Label(card_frame, text=student['id'], font=("Arial", 8, "bold"), fg="gray50", bg="white")
+            id_lbl.pack()
+            
+            name_lbl = tk.Label(card_frame, text=student['name'], font=("Arial", 10, "bold"), bg="white")
+            name_lbl.pack()
+
             var = tk.StringVar(value="6")
             self.count_vars.append(var)
-            tk.Entry(self.counts_frame, textvariable=var, width=5, justify="center").grid(row=1, column=idx, padx=5, pady=2)
+            count_entry = tk.Entry(card_frame, textvariable=var, width=4, justify="center")
+            count_entry.pack(pady=2)
+
+            card_data = {
+                "id": student['id'],
+                "name": student['name'],
+                "var": var,
+                "frame": card_frame,
+                "id_lbl": id_lbl,
+                "name_lbl": name_lbl
+            }
+            self.student_cards.append(card_data)
+
+            for w in (card_frame, id_lbl, name_lbl):
+                w.bind("<ButtonPress-1>", lambda e, d=card_data: self.on_drag_start(e, d))
+                w.bind("<B1-Motion>", self.on_drag_motion)
+                w.bind("<ButtonRelease-1>", self.on_drag_release)
+
+    def on_drag_start(self, event, card_data):
+        self.dragged_card = card_data
+        self.dragged_card["frame"].config(bg="#e0f7fa")
+        self.dragged_card["id_lbl"].config(bg="#e0f7fa")
+        self.dragged_card["name_lbl"].config(bg="#e0f7fa")
+
+    def on_drag_motion(self, event):
+        if not getattr(self, 'dragged_card', None): return
+        x = event.x_root
+        current_index = self.student_cards.index(self.dragged_card)
+        target_index = current_index
+
+        for i, card in enumerate(self.student_cards):
+            if i == current_index: continue
+            cx = card["frame"].winfo_rootx()
+            cw = card["frame"].winfo_width()
+            if cx <= x <= cx + cw:
+                target_index = i
+                break
+
+        if target_index != current_index:
+            item = self.student_cards.pop(current_index)
+            self.student_cards.insert(target_index, item)
+            
+            for card in self.student_cards:
+                card["frame"].pack_forget()
+            for card in self.student_cards:
+                card["frame"].pack(side="left", padx=3)
+                
+            self.count_vars = [c["var"] for c in self.student_cards]
+
+    def on_drag_release(self, event):
+        if getattr(self, 'dragged_card', None):
+            self.dragged_card["frame"].config(bg="white")
+            self.dragged_card["id_lbl"].config(bg="white")
+            self.dragged_card["name_lbl"].config(bg="white")
+            self.dragged_card = None
+
+    def apply_bulk_count(self):
+        new_count = self.bulk_var.get().strip()
+        if not new_count.isdigit():
+            messagebox.showwarning("경고", "숫자만 입력해 주세요.")
+            return
+        for var in self.count_vars:
+            var.set(new_count)
+
+    def apply_bulk_suffix(self):
+        if not self.image_data:
+            messagebox.showwarning("경고", "먼저 사진을 불러와 주세요.")
+            return
+        new_suffix = self.bulk_suffix_var.get().strip()
+        for meta in self.image_data:
+            meta["t_suffix"].set(new_suffix)
 
     def get_selected_candidates(self):
         return [name for name, var in self.cand_vars.items() if var.get()]
@@ -257,19 +378,12 @@ class DentalAutoSorterApp:
             messagebox.showwarning("경고", "먼저 조를 선택해주세요.")
             return
             
-        students = self.student_data.get(group, [])
+        students = [{"id": card["id"], "name": card["name"]} for card in self.student_cards]
         photo_counts = []
         for var in self.count_vars:
             val = var.get().strip()
-            if val.isdigit():
-                photo_counts.append(int(val))
-            else:
-                messagebox.showwarning("경고", "사진 수는 반드시 숫자로 입력해야 합니다.")
-                return
-                
-        if len(photo_counts) != len(students):
-            messagebox.showwarning("경고", f"입력된 데이터에 문제가 있습니다.")
-            return
+            if val.isdigit(): photo_counts.append(int(val))
+            else: return
 
         self.folder_path = filedialog.askdirectory(title="사진 폴더 선택")
         if not self.folder_path: return
@@ -279,33 +393,20 @@ class DentalAutoSorterApp:
 
         files = [f for f in sorted(os.listdir(self.folder_path)) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         total_photos = sum(photo_counts)
-        if total_photos > len(files):
-            messagebox.showwarning("경고", f"설정한 사진 수의 합({total_photos}장)이 폴더의 실제 사진 수({len(files)}장)보다 많습니다.")
-            return
-
         candidates = self.get_selected_candidates()
         
-        # --- 로딩바 UI 생성 ---
         progress_win = tk.Toplevel(self.root)
         progress_win.title("분석 중")
         progress_win.geometry("350x120")
-        progress_win.transient(self.root) # 메인 윈도우 위에 고정
-        progress_win.grab_set() # 팝업이 떠 있는 동안 메인 윈도우 클릭 방지
-        
-        # 팝업을 화면 중앙에 배치
-        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - 175
-        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - 60
-        progress_win.geometry(f"+{x}+{y}")
+        progress_win.transient(self.root) 
+        progress_win.grab_set() 
         
         progress_label = tk.Label(progress_win, text="AI가 사진을 분석하고 있습니다...\n잠시만 기다려주세요.", font=("Arial", 10))
         progress_label.pack(pady=15)
-        
         progress_bar = ttk.Progressbar(progress_win, orient="horizontal", length=280, mode="determinate")
         progress_bar.pack(pady=5)
         progress_bar["maximum"] = total_photos
-        
-        self.root.update() # UI 강제 업데이트
-        # ----------------------
+        self.root.update() 
 
         file_idx = 0
         current_progress = 0
@@ -319,59 +420,102 @@ class DentalAutoSorterApp:
 
             info_frame = tk.Frame(row_frame, width=150)
             info_frame.pack(side="left", fill="y", padx=10)
-            tk.Label(info_frame, text=f"교번: {student['id']}").pack(anchor="w")
-            tk.Label(info_frame, text=f"이름: {student['name']}").pack(anchor="w")
+            tk.Label(info_frame, text=f"교번: {student['id']}", font=("Arial", 10, "bold")).pack(anchor="w")
+            tk.Label(info_frame, text=f"이름: {student['name']}", font=("Arial", 10, "bold")).pack(anchor="w")
             tk.Label(info_frame, text=f"({count}장)").pack(anchor="w")
 
             id_var = tk.StringVar(value=student['id'])
             name_var = tk.StringVar(value=student['name'])
 
-            images_frame = tk.Frame(row_frame)
-            images_frame.pack(side="left", fill="x", expand=True)
+            canvas_frame = tk.Frame(row_frame)
+            canvas_frame.pack(side="left", fill="x", expand=True)
+
+            h_scroll = ttk.Scrollbar(canvas_frame, orient="horizontal")
+            h_scroll.pack(side="bottom", fill="x")
+
+            # 💡 [조정] 사진 크기가 줄었으니 캔버스 높이도 280 -> 240으로 다이어트!
+            img_canvas = tk.Canvas(canvas_frame, height=240, bg="gray90")
+            img_canvas.pack(side="top", fill="x", expand=True)
+
+            img_canvas.configure(xscrollcommand=h_scroll.set)
+            h_scroll.configure(command=img_canvas.xview)
+
+            images_frame = tk.Frame(img_canvas, bg="gray90")
+            img_canvas.create_window((0, 0), window=images_frame, anchor="nw")
+            
+            images_frame.bind("<Configure>", lambda e, c=img_canvas: c.configure(scrollregion=c.bbox("all")))
 
             for file in user_files:
                 img_path = os.path.join(self.folder_path, file)
                 self.create_image_panel(images_frame, img_path, id_var, name_var, candidates)
                 
-                # --- 로딩 진행도 업데이트 ---
                 current_progress += 1
                 progress_bar["value"] = current_progress
-                progress_label.config(text=f"AI가 사진을 분석하고 있습니다... ({current_progress}/{total_photos}장 완료)")
-                self.root.update() # 실시간으로 화면 갱신
-                # --------------------------
+                progress_label.config(text=f"AI가 분석 중... ({current_progress}/{total_photos}장 완료)")
+                self.root.update()
 
-        progress_win.destroy() # 로딩 완료 후 창 닫기
+        progress_win.destroy()
 
     def create_image_panel(self, parent, img_path, id_var, name_var, candidates):
-        panel = tk.Frame(parent, padx=5, pady=5)
+        panel = tk.Frame(parent, padx=10, pady=5, bg="gray90")
         panel.pack(side="left", anchor="n")
 
-        tooth_type, tooth_num, view_dir = self.ai.predict(img_path, candidates)
-        
-        rotation_angle = 0 
+        p_type, p_num, p_dir, rot_label = self.ai.predict(img_path, candidates)
+        abb_type = self.naming_rules.get(p_type, p_type)
+        abb_num = self.naming_rules.get(p_num, p_num)
+        abb_dir = self.naming_rules.get(p_dir, p_dir)
+        auto_rotation_angle = (90 * rot_label) % 360 
 
         img_meta = {
             "path": img_path, "id_var": id_var, "name_var": name_var,
-            "t_type": tk.StringVar(value=tooth_type), "t_num": tk.StringVar(value=tooth_num),
-            "v_dir": tk.StringVar(value=view_dir), "rotation": rotation_angle, "flipped": False,
-            "img_label": tk.Label(panel)
+            "t_type": tk.StringVar(value=abb_type), 
+            "t_num": tk.StringVar(value=abb_num),
+            "v_dir": tk.StringVar(value=abb_dir), 
+            "t_suffix": tk.StringVar(value=""),
+            "rotation": auto_rotation_angle, 
+            "flipped": False,
+            "img_label": tk.Label(panel, cursor="hand2") 
         }
         self.image_data.append(img_meta)
         
+        img_meta["img_label"].bind("<Button-1>", lambda e, m=img_meta: self.show_original_image(m))
         img_meta["img_label"].pack()
+        
         self.update_thumbnail(img_meta)
 
-        ctrl_frame = tk.Frame(panel)
-        ctrl_frame.pack(fill="x", pady=2)
-        tk.Entry(ctrl_frame, textvariable=img_meta["t_type"], width=6).pack(side="left")
-        tk.Entry(ctrl_frame, textvariable=img_meta["t_num"], width=9).pack(side="left") 
-        tk.Entry(ctrl_frame, textvariable=img_meta["v_dir"], width=4).pack(side="left")
+        ctrl_frame = tk.Frame(panel, bg="gray90")
+        ctrl_frame.pack(fill="x", pady=5)
+        
+        tk.Entry(ctrl_frame, textvariable=img_meta["t_type"], width=5, font=("Arial", 11)).pack(side="left", padx=1)
+        tk.Entry(ctrl_frame, textvariable=img_meta["t_num"], width=6, font=("Arial", 11)).pack(side="left", padx=1) 
+        tk.Entry(ctrl_frame, textvariable=img_meta["v_dir"], width=4, font=("Arial", 11)).pack(side="left", padx=1)
+        tk.Entry(ctrl_frame, textvariable=img_meta["t_suffix"], width=4, font=("Arial", 11)).pack(side="left", padx=1) 
 
-        btn_frame = tk.Frame(panel)
+        btn_frame = tk.Frame(panel, bg="gray90")
         btn_frame.pack(fill="x")
-        tk.Button(btn_frame, text="90°", command=lambda m=img_meta: self.add_rotation(m, 90)).pack(side="left", expand=True)
-        tk.Button(btn_frame, text="180°", command=lambda m=img_meta: self.add_rotation(m, 180)).pack(side="left", expand=True)
-        tk.Button(btn_frame, text="↔", command=lambda m=img_meta: self.flip_image(m)).pack(side="left", expand=True)
+        tk.Button(btn_frame, text="90°", command=lambda m=img_meta: self.add_rotation(m, 90)).pack(side="left", expand=True, padx=1)
+        tk.Button(btn_frame, text="180°", command=lambda m=img_meta: self.add_rotation(m, 180)).pack(side="left", expand=True, padx=1)
+        tk.Button(btn_frame, text="반전", command=lambda m=img_meta: self.flip_image(m)).pack(side="left", expand=True, padx=1)
+
+    def show_original_image(self, img_meta):
+        top = tk.Toplevel(self.root)
+        top.title("원본 사진 크게 보기")
+        
+        img = Image.open(img_meta["path"])
+        img = ImageOps.exif_transpose(img)
+        if img_meta["rotation"] != 0:
+            img = img.rotate(-img_meta["rotation"], expand=True)
+        if img_meta["flipped"]: 
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            
+        screen_w = self.root.winfo_screenwidth() - 100
+        screen_h = self.root.winfo_screenheight() - 100
+        img.thumbnail((screen_w, screen_h))
+        
+        photo = ImageTk.PhotoImage(img)
+        lbl = tk.Label(top, image=photo)
+        lbl.image = photo 
+        lbl.pack(padx=10, pady=10)
 
     def add_rotation(self, img_meta, angle):
         img_meta["rotation"] = (img_meta["rotation"] + angle) % 360
@@ -383,6 +527,7 @@ class DentalAutoSorterApp:
 
     def update_thumbnail(self, img_meta):
         img = Image.open(img_meta["path"])
+        img = ImageOps.exif_transpose(img)
         
         if img_meta["rotation"] != 0:
             img = img.rotate(-img_meta["rotation"], expand=True)
@@ -390,7 +535,8 @@ class DentalAutoSorterApp:
         if img_meta["flipped"]: 
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
             
-        img.thumbnail((120, 120))
+        # 💡 [핵심] 이미지 크기를 180x180에서 144x144(80%)로 축소 
+        img.thumbnail((144, 144))
         photo = ImageTk.PhotoImage(img)
         img_meta["img_label"].config(image=photo)
         img_meta["img_label"].image = photo 
@@ -399,8 +545,7 @@ class DentalAutoSorterApp:
         if not self.image_data: return
         
         group_name = self.group_combo.get()
-        if not group_name:
-            group_name = "결과물"
+        if not group_name: group_name = "결과물"
             
         original_result_dir = os.path.join(self.folder_path, group_name)
         result_dir = original_result_dir
@@ -416,19 +561,23 @@ class DentalAutoSorterApp:
 
         count = 0
         for meta in self.image_data:
-            final_type = meta['t_type'].get().strip()
-            final_num = meta['t_num'].get().strip()
-            final_dir = meta['v_dir'].get().strip()
+            input_type = meta['t_type'].get().strip()
+            input_num = meta['t_num'].get().strip()
+            input_dir = meta['v_dir'].get().strip()
+            input_suffix = meta['t_suffix'].get().strip()
             student_name = meta['name_var'].get().strip()
             
             student_dir = os.path.join(result_dir, student_name)
             os.makedirs(student_dir, exist_ok=True)
             
-            out_type = self.naming_rules.get(final_type, final_type)
-            out_num = self.naming_rules.get(final_num, final_num)
-            out_dir = self.naming_rules.get(final_dir, final_dir)
+            out_type = self.naming_rules.get(input_type, input_type)
+            out_num = self.naming_rules.get(input_num, input_num)
+            out_dir = self.naming_rules.get(input_dir, input_dir)
             
             base_name = f"{meta['id_var'].get()}_{student_name}_{out_type}{out_num} {out_dir}"
+            if input_suffix:
+                base_name += f" {input_suffix}"
+                
             ext = os.path.splitext(meta["path"])[1]
             new_fp = os.path.join(student_dir, f"{base_name}{ext}")
             
@@ -438,17 +587,21 @@ class DentalAutoSorterApp:
                 dup += 1
 
             img = Image.open(meta["path"])
+            img = ImageOps.exif_transpose(img)
             
             if meta["rotation"] != 0:
                 img = img.rotate(-meta["rotation"], expand=True)
-                
             if meta["flipped"]: 
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 
             img.save(new_fp, quality=100)
             count += 1
             
-            label_folder_name = f"{final_type}_{final_num}_{final_dir}"
+            full_type = self.reverse_rules.get(out_type, out_type)
+            full_num = self.reverse_rules.get(out_num, out_num)
+            full_dir = self.reverse_rules.get(out_dir, out_dir)
+            
+            label_folder_name = f"{full_type}_{full_num}_{full_dir}"
             specific_dataset_dir = os.path.join(dataset_archive_dir, label_folder_name)
             os.makedirs(specific_dataset_dir, exist_ok=True)
             
@@ -457,7 +610,7 @@ class DentalAutoSorterApp:
             img.save(archive_fp, quality=100)
             
         saved_folder_name = os.path.basename(result_dir)
-        messagebox.showinfo("완료", f"'{saved_folder_name}' 폴더에 조원들의 실습 결과물 {count}장을 저장했습니다!\n\n(미래 AI 학습용 데이터도 자동 수집되었습니다.)")
+        messagebox.showinfo("완료", f"'{saved_folder_name}' 폴더에 조원들의 실습 결과물 {count}장을 저장했습니다!\n\n(완전 자동 정렬 V2.1.2 적용 완료!)")
 
 if __name__ == "__main__":
     root = tk.Tk()
